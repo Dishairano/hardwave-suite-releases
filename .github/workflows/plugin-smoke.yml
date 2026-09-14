@@ -1,0 +1,239 @@
+name: Plug-in smoke test
+run-name: smoke ${{ inputs.repo }} ${{ inputs.tag }}
+
+# The OS testers (roadmap idea 38). hw-os-testers on HQ dispatches this for every new plug-in
+# release. Each runner downloads the release file for its OS the way a user gets it, installs
+# the plug-in where hosts look for it, checks the bundle, and runs pluginval on the VST3 and the
+# CLAP validator on the CLAP. It uploads results/summary.json; HQ reads it, reports as the
+# Windows, macOS and Linux tester seats, and holds a release candidate back from stable when it
+# broke. No secrets are needed: the plug-in repositories are public.
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: Plug-in repository, for example hardwave-wettboi-vst
+        required: true
+      tag:
+        description: Release tag, for example v0.4.0-rc1
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: smoke-${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows, runner: windows-latest, asset: '*windows*' }
+          - { os: macos, runner: macos-latest, asset: '*macos*' }
+          - { os: linux, runner: ubuntu-latest, asset: '*linux*' }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PLUGIN_REPO: Dishairano/${{ inputs.repo }}
+      TAG: ${{ inputs.tag }}
+      OS_KEY: ${{ matrix.os }}
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Download the release
+        id: download
+        continue-on-error: true
+        run: |
+          mkdir -p dl results
+          gh release download "$TAG" -R "$PLUGIN_REPO" -p '${{ matrix.asset }}' -D dl
+          ls -la dl
+          test -n "$(ls dl)"
+
+      - name: Unpack
+        id: unpack
+        if: steps.download.outcome == 'success'
+        continue-on-error: true
+        run: |
+          mkdir -p pkg
+          for f in dl/*; do
+            case "$f" in
+              *.zip)
+                if [ "$OS_KEY" = macos ]; then ditto -x -k "$f" pkg
+                elif [ "$OS_KEY" = windows ]; then 7z x -y "$f" -opkg >/dev/null
+                else unzip -q -o "$f" -d pkg; fi ;;
+              *.tar.gz|*.tgz) tar xzf "$f" -C pkg ;;
+            esac
+          done
+          find pkg -maxdepth 2
+          VST3=$(find pkg -maxdepth 2 -name '*.vst3' -type d | head -1)
+          CLAP=$(find pkg -maxdepth 2 -name '*.clap' | head -1)
+          test -n "$VST3" && test -n "$CLAP"
+          echo "VST3_SRC=$VST3" >> "$GITHUB_ENV"
+          echo "CLAP_SRC=$CLAP" >> "$GITHUB_ENV"
+
+      - name: Install where hosts look
+        id: install
+        if: steps.unpack.outcome == 'success'
+        continue-on-error: true
+        run: |
+          case "$OS_KEY" in
+            windows) V="/c/Program Files/Common Files/VST3"; C="/c/Program Files/Common Files/CLAP"; SUDO="" ;;
+            macos)   V="/Library/Audio/Plug-Ins/VST3"; C="/Library/Audio/Plug-Ins/CLAP"; SUDO=sudo ;;
+            linux)   V="$HOME/.vst3"; C="$HOME/.clap"; SUDO="" ;;
+          esac
+          $SUDO mkdir -p "$V" "$C"
+          $SUDO cp -R "$VST3_SRC" "$V/"
+          $SUDO cp -R "$CLAP_SRC" "$C/"
+          VP="$V/$(basename "$VST3_SRC")"; CP="$C/$(basename "$CLAP_SRC")"
+          test -e "$VP" && test -e "$CP"
+          if [ "$OS_KEY" = windows ]; then VP=$(cygpath -w "$VP"); CP=$(cygpath -w "$CP"); fi
+          echo "VST3_PATH=$VP" >> "$GITHUB_ENV"
+          echo "CLAP_PATH=$CP" >> "$GITHUB_ENV"
+
+      - name: Check the bundle
+        id: bundle
+        if: steps.install.outcome == 'success'
+        continue-on-error: true
+        run: |
+          set -e
+          case "$OS_KEY" in
+            macos)
+              for b in "$VST3_PATH" "$CLAP_PATH"; do
+                bin=$(find "$b/Contents/MacOS" -type f | head -1)
+                archs=$(lipo -archs "$bin")
+                echo "$(basename "$b"): $archs"
+                echo "$archs" | grep -q x86_64 || { echo "$(basename "$b") has no Intel (x86_64) code" | tee -a results/bundle.txt; exit 1; }
+                echo "$archs" | grep -q arm64 || { echo "$(basename "$b") has no Apple Silicon (arm64) code" | tee -a results/bundle.txt; exit 1; }
+                codesign --verify --deep --strict "$b" 2>&1 || echo "$(basename "$b"): codesign verify failed (unsigned build)" | tee -a results/notes.txt
+              done ;;
+            windows)
+              V=$(cygpath -u "$VST3_PATH")
+              test -n "$(find "$V/Contents" -name '*.vst3' -type f | head -1)" || { echo "the VST3 bundle has no Windows binary" | tee -a results/bundle.txt; exit 1; } ;;
+            linux)
+              sudo apt-get update -qq >/dev/null && sudo apt-get install -y -qq libwebkit2gtk-4.1-0 >/dev/null
+              so=$(find "$VST3_PATH/Contents" -name '*.so' | head -1)
+              missing=$(ldd "$so" | grep 'not found' || true)
+              [ -z "$missing" ] || { echo "missing libraries: $missing" | tee -a results/bundle.txt; exit 1; } ;;
+          esac
+
+      - name: Get the validators
+        id: tools
+        if: steps.install.outcome == 'success'
+        continue-on-error: true
+        run: |
+          mkdir -p tools/pv tools/cv
+          case "$OS_KEY" in
+            windows) pv=pluginval_Windows.zip; cv='*windows*' ;;
+            macos)   pv=pluginval_macOS.zip; cv='*macos-universal*' ;;
+            linux)   pv=pluginval_Linux.zip; cv='*ubuntu*' ;;
+          esac
+          gh release download v1.0.4 -R Tracktion/pluginval -p "$pv" -D tools/pv
+          gh release download 0.4.1 -R free-audio/clap-validator -p "$cv" -D tools/cv
+          for d in tools/pv tools/cv; do
+            for z in "$d"/*.zip; do
+              if [ "$OS_KEY" = windows ]; then 7z x -y "$z" -o"$d" >/dev/null; else unzip -q -o "$z" -d "$d"; fi
+            done
+            for t in "$d"/*.tar.gz; do [ -f "$t" ] && tar xzf "$t" -C "$d"; done
+          done
+          PV=$(find "$PWD/tools/pv" -type f \( -name pluginval -o -name pluginval.exe \) | head -1)
+          CV=$(find "$PWD/tools/cv" -type f \( -name clap-validator -o -name clap-validator.exe \) | head -1)
+          test -n "$PV" && test -n "$CV"
+          chmod +x "$PV" "$CV" 2>/dev/null || true
+          echo "PV=$PV" >> "$GITHUB_ENV"
+          echo "CV=$CV" >> "$GITHUB_ENV"
+
+      - name: pluginval (VST3)
+        id: pluginval
+        if: steps.tools.outcome == 'success'
+        continue-on-error: true
+        run: |
+          "$PV" --strictness-level 5 --skip-gui-tests --timeout-ms 180000 --validate "$VST3_PATH" > results/pluginval.log 2>&1
+          code=$?
+          tail -20 results/pluginval.log
+          exit $code
+
+      - name: CLAP validator
+        id: clap
+        if: steps.tools.outcome == 'success'
+        continue-on-error: true
+        run: |
+          # It exits 0 even when tests fail, so the JSON is what counts.
+          "$CV" validate --json --only-failed --hide-output "$CLAP_PATH" > results/clap.json 2> results/clap.err || true
+          test -s results/clap.json
+
+      - name: Write the summary
+        if: always()
+        shell: python
+        env:
+          O_DOWNLOAD: ${{ steps.download.outcome }}
+          O_UNPACK: ${{ steps.unpack.outcome }}
+          O_INSTALL: ${{ steps.install.outcome }}
+          O_BUNDLE: ${{ steps.bundle.outcome }}
+          O_TOOLS: ${{ steps.tools.outcome }}
+          O_PLUGINVAL: ${{ steps.pluginval.outcome }}
+          O_CLAP: ${{ steps.clap.outcome }}
+        run: |
+          import json, os, pathlib
+          res = pathlib.Path("results"); res.mkdir(exist_ok=True)
+          def text(name, n=1200):
+              p = res / name
+              return p.read_text(errors="replace")[-n:].strip() if p.exists() else ""
+          def pluginval_failures():
+              lines = text("pluginval.log", 200000).splitlines()
+              bad = [l.strip() for l in lines if "FAILED" in l or "!!!" in l]
+              return "; ".join(bad[-6:]) or "\n".join(lines[-8:])
+          steps = [
+              ("download", "O_DOWNLOAD", "downloaded the release file", "could not download a release file for this OS"),
+              ("unpack", "O_UNPACK", "unpacked a VST3 and a CLAP", "the release file did not contain both a .vst3 and a .clap"),
+              ("install", "O_INSTALL", "installed into the system plug-in folders", "could not install into the plug-in folders"),
+              ("bundle", "O_BUNDLE", "bundle has the right binaries", None),
+              ("tools", "O_TOOLS", "validators ready", "could not fetch pluginval or the CLAP validator (runner problem, not the plug-in)"),
+              ("pluginval", "O_PLUGINVAL", "pluginval passed at strictness 5 (no GUI tests)", None),
+              ("clap", "O_CLAP", "the CLAP validator ran", "the CLAP validator did not run: " + text("clap.err", 400)),
+          ]
+          checks = []
+          for name, env, ok_text, fail_text in steps:
+              outcome = os.environ.get(env, "")
+              if outcome == "success":
+                  checks.append({"name": name, "ok": True, "detail": ok_text})
+              elif outcome == "failure":
+                  if name == "bundle":
+                      fail_text = text("bundle.txt", 600) or "the bundle check failed"
+                  if name == "pluginval":
+                      fail_text = "pluginval failed: " + pluginval_failures()[:900]
+                  checks.append({"name": name, "ok": False, "detail": fail_text})
+          clap_failed = []
+          try:
+              for r in json.loads(text("clap.json", 10_000_000)).get("results", []):
+                  code = (r.get("status") or {}).get("code")
+                  if code in ("success", "skipped"):
+                      continue
+                  test = next(iter(r.get("test", {}).values()), {}).get("test", "?")
+                  clap_failed.append({"test": test, "code": code, "details": ((r.get("status") or {}).get("details") or "")[:700]})
+          except Exception:
+              pass
+          summary = {"os": os.environ["OS_KEY"], "repo": os.environ["PLUGIN_REPO"], "tag": os.environ["TAG"],
+                     "checks": checks, "clapFailed": clap_failed, "notes": text("notes.txt", 600)}
+          (res / "summary.json").write_text(json.dumps(summary, indent=1))
+          print(json.dumps(summary, indent=1)[:3000])
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: smoke-${{ matrix.os }}
+          path: results/
+          if-no-files-found: warn
+
+      - name: Fail the job when something broke
+        if: always()
+        shell: python
+        run: |
+          import json, sys
+          s = json.load(open("results/summary.json"))
+          sys.exit(1 if any(not c["ok"] for c in s["checks"]) or s["clapFailed"] else 0)
