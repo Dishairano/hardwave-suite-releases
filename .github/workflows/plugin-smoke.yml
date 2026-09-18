@@ -42,6 +42,10 @@ jobs:
       TAG: ${{ inputs.tag }}
       OS_KEY: ${{ matrix.os }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -167,6 +171,18 @@ jobs:
           "$CV" validate --json --only-failed --hide-output "$CLAP_PATH" > results/clap.json 2> results/clap.err || true
           test -s results/clap.json
 
+      # The listening tester (roadmap idea 58). The validators check the API; this plays the
+      # plug-in test signals and checks what comes out: NaNs and silent output fail it, clicks,
+      # noise from silence, DC and clipping are reported as warnings. The WAVs go up with the
+      # results so a person can listen to exactly what the tester heard.
+      - name: Listen
+        id: listen
+        if: steps.install.outcome == 'success'
+        continue-on-error: true
+        run: |
+          python -m pip install --quiet pedalboard numpy soundfile mido
+          python scripts/listen.py "$VST3_PATH" results
+
       - name: Write the summary
         if: always()
         shell: python
@@ -178,6 +194,7 @@ jobs:
           O_TOOLS: ${{ steps.tools.outcome }}
           O_PLUGINVAL: ${{ steps.pluginval.outcome }}
           O_CLAP: ${{ steps.clap.outcome }}
+          O_LISTEN: ${{ steps.listen.outcome }}
         run: |
           import json, os, pathlib
           res = pathlib.Path("results"); res.mkdir(exist_ok=True)
@@ -196,7 +213,12 @@ jobs:
               ("tools", "O_TOOLS", "validators ready", "could not fetch pluginval or the CLAP validator (runner problem, not the plug-in)"),
               ("pluginval", "O_PLUGINVAL", "pluginval passed at strictness 5 (no GUI tests)", None),
               ("clap", "O_CLAP", "the CLAP validator ran", "the CLAP validator did not run: " + text("clap.err", 400)),
+              ("listen", "O_LISTEN", "listened: no NaNs, no silent output", None),
           ]
+          try:
+              heard = json.loads(text("listen.json", 2_000_000) or "{}")
+          except Exception:
+              heard = {}
           checks = []
           for name, env, ok_text, fail_text in steps:
               outcome = os.environ.get(env, "")
@@ -207,6 +229,8 @@ jobs:
                       fail_text = text("bundle.txt", 600) or "the bundle check failed"
                   if name == "pluginval":
                       fail_text = "pluginval failed: " + pluginval_failures()[:900]
+                  if name == "listen":
+                      fail_text = "listening failed: " + ("; ".join(heard.get("hard") or []) or heard.get("error") or "the listening step did not finish")[:900]
                   checks.append({"name": name, "ok": False, "detail": fail_text})
           clap_failed = []
           try:
@@ -219,7 +243,9 @@ jobs:
           except Exception:
               pass
           summary = {"os": os.environ["OS_KEY"], "repo": os.environ["PLUGIN_REPO"], "tag": os.environ["TAG"],
-                     "checks": checks, "clapFailed": clap_failed, "notes": text("notes.txt", 600)}
+                     "checks": checks, "clapFailed": clap_failed, "notes": text("notes.txt", 600),
+                     "listenWarnings": heard.get("warn") or [],
+                     "listened": [{k: t.get(k) for k in ("signal", "peak_dbfs", "rms_dbfs", "clicks")} for t in heard.get("tests") or []]}
           (res / "summary.json").write_text(json.dumps(summary, indent=1))
           print(json.dumps(summary, indent=1)[:3000])
 
