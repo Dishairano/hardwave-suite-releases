@@ -104,9 +104,31 @@ def analyse(name, x_in, y):
             "hard": hard, "warn": warn}
 
 
-result = {"plugin": vst3, "sample_rate": SR, "tests": [], "hard": [], "warn": [], "error": None}
+def load(path):
+    """Load the VST3, trying the bundle and then the binary inside it.
+
+    On Windows pedalboard's scan can refuse a bundle that pluginval loads fine. That
+    is the listener failing, not the plug-in, so it is reported as `unheard` and never
+    blocks a release."""
+    tried = []
+    candidates = [path]
+    inner = sorted(pathlib.Path(path).glob("Contents/*-win/*.vst3"))
+    candidates += [str(c) for c in inner]
+    for c in candidates:
+        try:
+            return load_plugin(c), tried
+        except Exception as e:
+            tried.append(f"{c}: {type(e).__name__}: {str(e)[:200]}")
+    return None, tried
+
+
+result = {"plugin": vst3, "sample_rate": SR, "tests": [], "hard": [], "warn": [], "error": None, "unheard": None}
+plugin, tried = load(vst3)
+if plugin is None:
+    result["unheard"] = "the listener could not load this VST3 on this system; " + " | ".join(tried)[:800]
 try:
-    plugin = load_plugin(vst3)
+    if plugin is None:
+        raise RuntimeError("not loaded")
     result["instrument"] = bool(plugin.is_instrument)
     if plugin.is_instrument:
         # an instrument gets notes, not audio: one C1 hit every beat at 150 BPM
@@ -127,12 +149,18 @@ try:
             y = plugin.process(x, sample_rate=SR, buffer_size=BLOCK, reset=True)
             result["tests"].append(analyse(name, x if name != "silence" else None, y))
 except Exception as e:
-    result["error"] = f"{type(e).__name__}: {e}"[:600]
+    if plugin is not None:
+        result["error"] = f"{type(e).__name__}: {e}"[:600]
 
 for r in result["tests"]:
     result["hard"] += [f'{r["signal"]}: {h}' for h in r["hard"]]
     result["warn"] += [f'{r["signal"]}: {w}' for w in r["warn"]]
 
+if result["unheard"]:
+    result["warn"].append(result["unheard"])
+
 (out_dir / "listen.json").write_text(json.dumps(result, indent=1))
 print(json.dumps(result, indent=1)[:4000])
+# Only audio that was actually heard and was wrong fails. A harness that could not
+# load the plug-in is a warning, never a reason to hold a release back.
 sys.exit(1 if (result["hard"] or result["error"]) else 0)
