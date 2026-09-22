@@ -233,17 +233,24 @@ jobs:
                       fail_text = "listening failed: " + ("; ".join(heard.get("hard") or []) or heard.get("error") or "the listening step did not finish")[:900]
                   checks.append({"name": name, "ok": False, "detail": fail_text})
           clap_failed = []
+          clap_warnings = []
           try:
               for r in json.loads(text("clap.json", 10_000_000)).get("results", []):
                   code = (r.get("status") or {}).get("code")
                   if code in ("success", "skipped"):
                       continue
                   test = next(iter(r.get("test", {}).values()), {}).get("test", "?")
-                  clap_failed.append({"test": test, "code": code, "details": ((r.get("status") or {}).get("details") or "")[:700]})
+                  entry = {"test": test, "code": code, "details": ((r.get("status") or {}).get("details") or "")[:700]}
+                  # The validator warns as well as fails, and a warning is advice, not a broken
+                  # plug-in. "The plugin took 2.08x longer to process denormals" held LoudLab
+                  # v0.7.2-rc1 back as if it had stopped working. Warnings are reported and do
+                  # not turn a release red.
+                  (clap_warnings if code == "warning" else clap_failed).append(entry)
           except Exception:
               pass
           summary = {"os": os.environ["OS_KEY"], "repo": os.environ["PLUGIN_REPO"], "tag": os.environ["TAG"],
-                     "checks": checks, "clapFailed": clap_failed, "notes": text("notes.txt", 600),
+                     "checks": checks, "clapFailed": clap_failed, "clapWarnings": clap_warnings,
+                     "notes": text("notes.txt", 600),
                      "listenWarnings": heard.get("warn") or [],
                      "listened": [{k: t.get(k) for k in ("signal", "peak_dbfs", "rms_dbfs", "clicks")} for t in heard.get("tests") or []]}
           (res / "summary.json").write_text(json.dumps(summary, indent=1))
