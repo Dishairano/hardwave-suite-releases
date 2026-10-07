@@ -6,7 +6,9 @@ run-name: smoke ${{ inputs.repo }} ${{ inputs.tag }}
 # the plug-in where hosts look for it, checks the bundle, and runs pluginval on the VST3 and the
 # CLAP validator on the CLAP. It uploads results/summary.json; HQ reads it, reports as the
 # Windows, macOS and Linux tester seats, and holds a release candidate back from stable when it
-# broke. No secrets are needed: the plug-in repositories are public.
+# broke. Four plug-in repositories are private since 2026-09-24, so the build is fetched from
+# hardwavestudios.com's own mirror with the SMOKE_DOWNLOAD_KEY secret (masked in these public logs);
+# a public repository's release is the fallback.
 
 on:
   workflow_dispatch:
@@ -41,6 +43,7 @@ jobs:
       PLUGIN_REPO: Dishairano/${{ inputs.repo }}
       TAG: ${{ inputs.tag }}
       OS_KEY: ${{ matrix.os }}
+      SMOKE_KEY: ${{ secrets.SMOKE_DOWNLOAD_KEY }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -55,6 +58,24 @@ jobs:
         continue-on-error: true
         run: |
           mkdir -p dl results
+          # Our mirror first: it is the only source for a private repository. It copies a new build
+          # within ten minutes of its release, so wait up to twenty for it before giving up on it.
+          slug=$(echo "$PLUGIN_REPO" | sed -E 's#.*/hardwave-(.*)-vst#\1#')
+          ver="${TAG#v}"
+          base="https://hardwavestudios.com/api/plugins/smoke/$slug/$ver"
+          if [ -n "$SMOKE_KEY" ]; then
+            for i in $(seq 1 20); do
+              if curl -fsS -H "X-Smoke-Key: $SMOKE_KEY" "$base" -o names.txt && [ -s names.txt ]; then break; fi
+              echo "not on the mirror yet ($i/20)"; sleep 60
+            done
+            while read -r name; do
+              case "$name" in
+                ${{ matrix.asset }}) curl -fsSL --retry 3 --retry-delay 5 -H "X-Smoke-Key: $SMOKE_KEY" -o "dl/$name" "$base/$name" ;;
+              esac
+            done < names.txt 2>/dev/null || true
+          fi
+          if [ -n "$(ls -A dl)" ]; then ls -la dl; exit 0; fi
+          echo "not on our mirror; trying the GitHub release"
           # `gh release download` reads the assets embedded in the release object, and on a
           # freshly published release GitHub serves that array empty for hours while the assets
           # themselves are there and downloadable. On 2026-09-23 six release candidates were all
