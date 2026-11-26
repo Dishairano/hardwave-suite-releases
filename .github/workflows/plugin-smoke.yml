@@ -6,9 +6,9 @@ run-name: smoke ${{ inputs.repo }} ${{ inputs.tag }}
 # the plug-in where hosts look for it, checks the bundle, and runs pluginval on the VST3 and the
 # CLAP validator on the CLAP. It uploads results/summary.json; HQ reads it, reports as the
 # Windows, macOS and Linux tester seats, and holds a release candidate back from stable when it
-# broke. Four plug-in repositories are private since 2026-09-24, so the build is fetched from
-# hardwavestudios.com's own mirror with the SMOKE_DOWNLOAD_KEY secret (masked in these public logs);
-# a public repository's release is the fallback.
+# broke. Every plug-in repository is private (the last two since 2026-11-26), so the build is fetched
+# from hardwavestudios.com's own mirror with the SMOKE_DOWNLOAD_KEY secret (masked in these public
+# logs). There is no GitHub fallback: a private repository's release cannot be fetched from here.
 
 on:
   workflow_dispatch:
@@ -75,27 +75,10 @@ jobs:
             done < names.txt 2>/dev/null || true
           fi
           if [ -n "$(ls -A dl)" ]; then ls -la dl; exit 0; fi
-          echo "not on our mirror; trying the GitHub release"
-          # `gh release download` reads the assets embedded in the release object, and on a
-          # freshly published release GitHub serves that array empty for hours while the assets
-          # themselves are there and downloadable. On 2026-09-23 six release candidates were all
-          # marked "could not download a release file for this OS" an hour after they built. So
-          # try the normal way first, then ask the assets endpoint, which is right straight away.
-          gh release download "$TAG" -R "$PLUGIN_REPO" -p '${{ matrix.asset }}' -D dl || true
-          if [ -z "$(ls -A dl)" ]; then
-            echo "the release object lists no assets; asking the assets endpoint"
-            id=$(gh api "repos/$PLUGIN_REPO/releases/tags/$TAG" --jq .id)
-            gh api "repos/$PLUGIN_REPO/releases/$id/assets" \
-              --jq '.[] | "\(.name)\t\(.browser_download_url)"' > assets.tsv
-            cat assets.tsv
-            while IFS=$'\t' read -r name url; do
-              case "$name" in
-                ${{ matrix.asset }}) curl -sSL --retry 3 --retry-delay 5 -o "dl/$name" "$url" ;;
-              esac
-            done < assets.tsv
-            ls -la dl
-          fi
-          test -n "$(ls -A dl)"
+          # The GitHub release used to be the fallback here. Every plug-in repository is private now,
+          # so it could only fail; the mirror is the one source.
+          echo "::error::no ${{ matrix.asset }} build of $TAG on our mirror after 20 minutes"
+          exit 1
 
       - name: Unpack
         id: unpack
